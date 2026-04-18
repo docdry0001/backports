@@ -1,0 +1,314 @@
+name: Build Wireless Backports Modules for OP11R
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: "Manifest preset"
+        required: true
+        default: "OOS16"
+        type: choice
+        options:
+          - OOS14
+          - OOS15
+          - OOS16
+      backports_release:
+        description: "Stable backports release"
+        required: true
+        default: "backports-6.1.97-1"
+        type: choice
+        options:
+          - backports-6.1.97-1
+
+jobs:
+  build-wireless-modules:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    env:
+      MODEL: OP11R
+      SOC: waipio
+      CONFIG: OP11R
+      BRANCH: oneplus/sm8475
+      MANIFEST_OOS14_MODULES: oneplus_11r_u.xml
+      MANIFEST_OOS15_MODULES: oneplus_11r_v.xml
+      MANIFEST_OOS16_MODULES: oneplus_11r_b.xml
+
+    steps:
+      - name: Validate target
+        run: |
+          set -e
+          [ "$MODEL" = "OP11R" ] || exit 1
+          [ "$SOC" = "waipio" ] || exit 1
+          echo "Target validation passed"
+
+      - name: Cleanup runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/.ghcup \
+            /usr/local/lib/android /usr/local/share/chromium /opt/microsoft \
+            /opt/google /opt/az /usr/local/share/powershell /opt/hostedtoolcache 2>/dev/null || true
+          docker system prune -af 2>/dev/null || true
+          df -h
+
+      - name: Install dependencies
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential clang lld flex bison \
+            libelf-dev libssl-dev libncurses-dev zlib1g-dev liblz4-tool \
+            libxml2-utils rsync unzip dwarves file python3 ccache wget patch jq \
+            coccinelle kmod bc perl xz-utils zip device-tree-compiler \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+          sudo apt-get clean
+
+      - name: Set manifest
+        run: |
+          set -e
+          case "${{ github.event.inputs.manifest }}" in
+            OOS14) echo "MANIFEST=$MANIFEST_OOS14_MODULES" >> "$GITHUB_ENV" ;;
+            OOS15) echo "MANIFEST=$MANIFEST_OOS15_MODULES" >> "$GITHUB_ENV" ;;
+            OOS16) echo "MANIFEST=$MANIFEST_OOS16_MODULES" >> "$GITHUB_ENV" ;;
+            *) echo "Unknown manifest"; exit 1 ;;
+          esac
+
+      - name: Install repo
+        run: |
+          sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod +x /usr/local/bin/repo
+
+      - name: Sync OP11R kernel source
+        run: |
+          set -e
+          mkdir -p "$CONFIG" && cd "$CONFIG"
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b "$BRANCH" -m "$MANIFEST" --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
+          for i in 1 2 3; do
+            if repo sync -c --no-clone-bundle --no-tags --optimized-fetch -j$(nproc) --fail-fast; then
+              break
+            fi
+            [ $i -lt 3 ] && sleep 20 || { echo "Sync failed"; exit 1; }
+          done
+
+      - name: Locate prebuilt clang
+        run: |
+          set -e
+          FOUND=false
+          for base in "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/prebuilts-master/clang/host/linux-x86" \
+                      "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/prebuilts/clang/host/linux-x86"; do
+            [ -d "$base" ] || continue
+            latest=$(ls -1d "$base"/clang-* 2>/dev/null | sort -V | tail -n1 || true)
+            if [ -n "$latest" ] && [ -x "$latest/bin/clang" ]; then
+              echo "CLANG_BIN=$latest/bin" >> "$GITHUB_ENV"
+              FOUND=true
+              echo "Prebuilt clang: $latest/bin"
+              break
+            fi
+          done
+          if ! $FOUND; then
+            echo "CLANG_BIN=$(dirname "$(command -v clang)")" >> "$GITHUB_ENV"
+          fi
+
+      - name: Prepare kernel tree (detect version + configure + modules_prepare)
+        run: |
+          set -e
+          MSM="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/msm-kernel"
+          cd "$MSM"
+
+          KV=$(grep '^VERSION'    Makefile | awk '{print $3}')
+          KP=$(grep '^PATCHLEVEL' Makefile | awk '{print $3}')
+          KS=$(grep '^SUBLEVEL'   Makefile | awk '{print $3}')
+          echo "KERNEL_VER=${KV}.${KP}.${KS}" >> "$GITHUB_ENV"
+
+          export PATH="${CLANG_BIN}:$PATH:/usr/lib/ccache"
+          FLAGS=(LLVM=1 LLVM_IAS=1 ARCH=arm64 SUBARCH=arm64 \
+                 CLANG_TRIPLE=aarch64-linux-gnu- \
+                 CROSS_COMPILE=aarch64-linux-gnu- \
+                 CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+                 LD=ld.lld HOSTLD=ld.lld AR=llvm-ar NM=llvm-nm \
+                 OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+                 STRIP=llvm-strip HOSTCC=clang HOSTCXX=clang++ CC=clang)
+
+          make "${FLAGS[@]}" mrproper
+          mkdir -p out
+          ./scripts/kconfig/merge_config.sh -O out -m \
+            arch/arm64/configs/gki_defconfig \
+            arch/arm64/configs/vendor/${SOC}_GKI.config || true
+          cp out/.config arch/arm64/configs/gki_defconfig
+          make "${FLAGS[@]}" O=out gki_defconfig
+
+          # Disable features that break backports modules
+          for sym in CFI CFI_CLANG LTO_CLANG LTO_CLANG_THIN SHADOW_CALL_STACK \
+                     KASAN KASAN_SW_TAGS KASAN_HW_TAGS UBSAN UBSAN_TRAP UBSAN_BOUNDS \
+                     TRIM_UNUSED_KSYMS MODULE_SIG_ALL MODVERSIONS; do
+            ./scripts/config --file out/.config --disable "CONFIG_$sym" || true
+          done
+          # Ensure module + bus support survives
+          for sym in MODULES MODULE_UNLOAD PCI USB USB_SUPPORT MMC; do
+            ./scripts/config --file out/.config --enable "CONFIG_$sym" || true
+          done
+
+          make "${FLAGS[@]}" O=out olddefconfig
+          make "${FLAGS[@]}" O=out -j$(nproc) modules_prepare
+          echo "Kernel prepared at $MSM/out"
+
+      - name: Download + extract backports
+        run: |
+          set -e
+          REL="${{ github.event.inputs.backports_release }}"
+          wget -q -O backports.tar.xz \
+            "https://cdn.kernel.org/pub/linux/kernel/projects/backports/stable/v6.1.97/${REL}.tar.xz"
+          tar -xf backports.tar.xz
+          mv "$REL" backports-stable
+          ls backports-stable/ | head
+
+      - name: Patch compat for CFI signatures
+        run: |
+          F=backports-stable/backport-include/linux/module.h
+          if [ -f "$F" ]; then
+            sed -i 's/__CFI_ADDRESSABLE(init_module, __initdata)/__CFI_ADDRESSABLE(init_module)/g' "$F"
+            sed -i 's/__CFI_ADDRESSABLE(cleanup_module, __exitdata)/__CFI_ADDRESSABLE(cleanup_module)/g' "$F"
+          fi
+
+      - name: Configure backports (defconfig-wifi, trimmed to MT76 + RTW88 + rtl8xxxu)
+        run: |
+          set -e
+          KERNEL_BUILD="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/msm-kernel/out"
+          export PATH="${CLANG_BIN}:$PATH:/usr/lib/ccache"
+          FLAGS=(LLVM=1 LLVM_IAS=1 ARCH=arm64 SUBARCH=arm64 \
+                 CLANG_TRIPLE=aarch64-linux-gnu- \
+                 CROSS_COMPILE=aarch64-linux-gnu- \
+                 CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+                 LD=ld.lld HOSTLD=ld.lld AR=llvm-ar NM=llvm-nm \
+                 OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+                 STRIP=llvm-strip HOSTCC=clang HOSTCXX=clang++ CC=clang)
+
+          cd backports-stable
+
+          # 1) Seed with backports' built-in wifi defconfig (enables cfg80211/mac80211 + all wifi)
+          make "${FLAGS[@]}" KLIB="$KERNEL_BUILD" KLIB_BUILD="$KERNEL_BUILD" defconfig-wifi
+
+          # 2) Disable vendors we don't need (keep MT76 + RTW88 + rtl8xxxu)
+          SCRIPTS_CONFIG=./kconf/scripts-config
+          [ -x "$SCRIPTS_CONFIG" ] || SCRIPTS_CONFIG=./scripts/config
+          disable() { "$SCRIPTS_CONFIG" --file .config --disable "$1" 2>/dev/null || \
+                      sed -i "s/^$1=.*/# $1 is not set/" .config; }
+          enable_m() { "$SCRIPTS_CONFIG" --file .config --module "$1" 2>/dev/null || \
+                       { sed -i "/^$1=/d;/^# $1 /d" .config; echo "$1=m" >> .config; }; }
+          enable_y() { "$SCRIPTS_CONFIG" --file .config --enable "$1" 2>/dev/null || \
+                       { sed -i "/^$1=/d;/^# $1 /d" .config; echo "$1=y" >> .config; }; }
+
+          for sym in IWLWIFI IWLMVM IWLDVM IWLEGACY \
+                     ATH5K ATH9K ATH9K_HTC ATH10K ATH11K ATH12K CARL9170 AR5523 WIL6210 \
+                     B43 B43LEGACY BRCMFMAC BRCMSMAC BRCMUTIL \
+                     RSI_91X RTLWIFI RTL8180 RTL8187 RTL_CARDS \
+                     WLAN_VENDOR_INTEL WLAN_VENDOR_ATH WLAN_VENDOR_BROADCOM \
+                     WLAN_VENDOR_RSI WLAN_VENDOR_MARVELL WLAN_VENDOR_TI \
+                     WLAN_VENDOR_ZYDAS WLAN_VENDOR_ADMTEK WLAN_VENDOR_ATMEL \
+                     WLAN_VENDOR_CISCO WLAN_VENDOR_ST WLAN_VENDOR_MICROCHIP \
+                     WLAN_VENDOR_QUANTENNA WLAN_VENDOR_SILABS WLAN_VENDOR_INTERSIL \
+                     MWIFIEX MWL8K LIBERTAS LIBERTAS_TF P54_COMMON \
+                     HOSTAP PRISM54 RNDIS_WLAN USB_NET_RNDIS_WLAN \
+                     WL1251 WL12XX WLCORE ORINOCO \
+                     USB_ZD1201 ZD1211RW \
+                     MT7601U MT7915E MT7915_COMMON MT7996E MT7996_COMMON; do
+            disable "CONFIG_$sym"
+          done
+
+          # 3) Ensure the drivers we want are modules
+          for sym in CFG80211 MAC80211 \
+                     WLAN_VENDOR_MEDIATEK MT76_CORE MT76_USB MT76_SDIO MT76_CONNAC_LIB \
+                     MT792x_LIB MT792x_USB MT7921_COMMON MT7921E MT7921U MT7921S \
+                     WLAN_VENDOR_REALTEK RTL8XXXU RTL8XXXU_UNTESTED \
+                     RTW88 RTW88_CORE RTW88_PCI RTW88_USB RTW88_8822BE RTW88_8822BU \
+                     RTW88_8822CE RTW88_8821CE RTW88_8821CU RTW88_8723DE \
+                     RTW88_8703B RTW88_8723D RTW88_8821C RTW88_8822B RTW88_8822C; do
+            enable_m "CONFIG_$sym"
+          done
+          # Userland helpers
+          for sym in CFG80211_WEXT WIRELESS_EXT WEXT_PRIV \
+                     CFG80211_DEFAULT_PS CFG80211_CRDA_SUPPORT; do
+            enable_y "CONFIG_$sym"
+          done
+
+          # 4) Resolve via oldconfig (pick defaults for any new prompts)
+          yes "" | make "${FLAGS[@]}" KLIB="$KERNEL_BUILD" KLIB_BUILD="$KERNEL_BUILD" \
+            oldconfig 2>&1 | tee oldconfig.log
+
+          echo "===== enabled module symbols ====="
+          grep -E '=m$' .config | sort
+          echo "==================================="
+          MCOUNT=$(grep -cE '=m$' .config || true)
+          echo "Module symbols enabled: $MCOUNT"
+          if [ "$MCOUNT" -lt 10 ]; then
+            echo "ERROR: too few modules enabled — oldconfig dropped dependencies."
+            echo "--- oldconfig.log tail ---"
+            tail -80 oldconfig.log
+            exit 1
+          fi
+
+      - name: Build backports modules
+        run: |
+          set -e
+          KERNEL_BUILD="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/msm-kernel/out"
+          export PATH="${CLANG_BIN}:$PATH:/usr/lib/ccache"
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+          mkdir -p "$CCACHE_DIR"
+          FLAGS=(LLVM=1 LLVM_IAS=1 ARCH=arm64 SUBARCH=arm64 \
+                 CLANG_TRIPLE=aarch64-linux-gnu- \
+                 CROSS_COMPILE=aarch64-linux-gnu- \
+                 CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+                 LD=ld.lld HOSTLD=ld.lld AR=llvm-ar NM=llvm-nm \
+                 OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+                 STRIP=llvm-strip HOSTCC=clang HOSTCXX=clang++ CC=clang)
+
+          cd backports-stable
+          set +e
+          make -j$(nproc) "${FLAGS[@]}" \
+            KLIB="$KERNEL_BUILD" KLIB_BUILD="$KERNEL_BUILD" \
+            V=1 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "--- last 200 lines of build.log ---"
+            tail -200 "$GITHUB_WORKSPACE/build.log"
+            exit "$RC"
+          fi
+
+      - name: Verify and collect .ko files
+        run: |
+          set -e
+          cd backports-stable
+          mapfile -t KO < <(find . -name '*.ko' -type f | sort)
+          echo "Total .ko files: ${#KO[@]}"
+          printf '  %s\n' "${KO[@]}"
+
+          # Hard guard: we expect at least cfg80211, mac80211, compat + the drivers
+          if [ "${#KO[@]}" -lt 5 ]; then
+            echo "ERROR: expected 5+ .ko files, got ${#KO[@]}"
+            grep -iE 'error:|undefined reference|No rule to make' "$GITHUB_WORKSPACE/build.log" | head -50 || true
+            exit 1
+          fi
+
+          mkdir -p ../modules-out
+          find . -name '*.ko' -type f -exec cp -v {} ../modules-out/ \;
+          cd ../modules-out
+          for ko in *.ko; do echo "  [$(du -h "$ko" | cut -f1)] $ko"; done
+          ARCHIVE="wireless-modules-op11r-mediatek-realtek-${GITHUB_RUN_NUMBER}.zip"
+          zip -r "$GITHUB_WORKSPACE/$ARCHIVE" *.ko
+          ls -lh "$GITHUB_WORKSPACE/$ARCHIVE"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wireless-modules-op11r-${{ github.run_number }}
+          path: |
+            wireless-modules-op11r-mediatek-realtek-*.zip
+            build.log
+            backports-stable/.config
+            backports-stable/oldconfig.log
+          if-no-files-found: warn
+          retention-days: 14
