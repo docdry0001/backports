@@ -1,0 +1,585 @@
+name: Build Wireless Backports Modules for OP11R (FIXED)
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: "Manifest preset"
+        required: true
+        default: "OOS16"
+        type: choice
+        options:
+          - OOS14
+          - OOS15
+          - OOS16
+      backports_release:
+        description: "Stable backports release"
+        required: true
+        default: "backports-6.1.97-1"
+        type: choice
+        options:
+          - backports-6.1.97-1
+      build_jobs:
+        description: "Parallel build jobs (2-8, lower = more stable)"
+        required: true
+        default: "4"
+        type: choice
+        options:
+          - "2"
+          - "4"
+          - "6"
+          - "8"
+
+jobs:
+  build-wireless-modules:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    env:
+      MODEL: OP11R
+      SOC: waipio
+      CONFIG: OP11R
+      BRANCH: oneplus/sm8475
+      MANIFEST_OOS14_MODULES: oneplus_11r_u.xml
+      MANIFEST_OOS15_MODULES: oneplus_11r_v.xml
+      MANIFEST_OOS16_MODULES: oneplus_11r_b.xml
+
+    steps:
+      - name: Validate target
+        run: |
+          set -e
+          [ "$MODEL" = "OP11R" ] || exit 1
+          [ "$SOC" = "waipio" ] || exit 1
+          echo "✓ Target validation passed"
+
+      - name: Cleanup runner
+        run: |
+          set -e
+          sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/.ghcup /usr/local/julia* \
+            /usr/local/lib/android /usr/local/share/chromium /opt/microsoft /opt/google \
+            /opt/az /usr/local/share/powershell /opt/hostedtoolcache 2>/dev/null || true
+          docker system prune -af 2>/dev/null || true
+          docker builder prune -af 2>/dev/null || true
+          echo "Disk space after cleanup:"
+          df -h
+
+      - name: Install dependencies
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential clang lld flex bison \
+            libelf-dev libssl-dev libncurses-dev zlib1g-dev liblz4-tool \
+            libxml2-utils rsync unzip dwarves file python3 ccache wget patch jq \
+            coccinelle kmod bc perl xz-utils zip device-tree-compiler \
+            python3-dev python-is-python3
+          sudo apt-get clean
+          echo "✓ Dependencies installed"
+
+      - name: Set manifest
+        run: |
+          set -e
+          case "${{ github.event.inputs.manifest }}" in
+            OOS14) echo "MANIFEST=$MANIFEST_OOS14_MODULES" >> "$GITHUB_ENV" ;;
+            OOS15) echo "MANIFEST=$MANIFEST_OOS15_MODULES" >> "$GITHUB_ENV" ;;
+            OOS16) echo "MANIFEST=$MANIFEST_OOS16_MODULES" >> "$GITHUB_ENV" ;;
+            *) echo "✗ Unknown manifest"; exit 1 ;;
+          esac
+          echo "✓ Manifest set to: $MANIFEST"
+
+      - name: Install repo
+        run: |
+          set -e
+          sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod +x /usr/local/bin/repo
+          repo --version
+          echo "✓ Repo tool installed"
+
+      - name: Sync OP11R kernel source
+        run: |
+          set -e
+          mkdir -p "$CONFIG"
+          cd "$CONFIG"
+          echo "Initializing repo..."
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b "$BRANCH" -m "$MANIFEST" --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
+
+          echo "Syncing kernel sources (3 retries)..."
+          for i in 1 2 3; do
+            echo "Attempt $i..."
+            if repo sync -c --no-clone-bundle --no-tags --optimized-fetch -j$(nproc) --fail-fast; then
+              echo "✓ Sync successful"
+              break
+            fi
+            if [ $i -lt 3 ]; then
+              echo "⟳ Sync failed, retrying in 20 seconds..."
+              sleep 20
+            else
+              echo "✗ Sync failed after 3 attempts"
+              exit 1
+            fi
+          done
+
+      - name: Detect kernel version and prepare tree
+        run: |
+          set -e
+          MSM="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/msm-kernel"
+          cd "$MSM"
+
+          echo "Detecting kernel version..."
+          VERSION=$(grep '^VERSION *=' Makefile | awk '{print $3}')
+          PATCHLEVEL=$(grep '^PATCHLEVEL *=' Makefile | awk '{print $3}')
+          SUBLEVEL=$(grep '^SUBLEVEL *=' Makefile | awk '{print $3}')
+          KERNEL_VER="${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
+          echo "KERNEL_VER=$KERNEL_VER" >> "$GITHUB_ENV"
+          echo "✓ Kernel version: $KERNEL_VER"
+
+          echo "Cleaning kernel tree..."
+          make ARCH=arm64 mrproper
+
+          mkdir -p out
+          echo "Merging kernel configs..."
+          ./scripts/kconfig/merge_config.sh -O out -m \
+            arch/arm64/configs/gki_defconfig \
+            arch/arm64/configs/vendor/${SOC}_GKI.config || {
+            echo "⟳ Config merge warning, continuing..."
+          }
+
+          cp out/.config arch/arm64/configs/gki_defconfig
+          make O=out ARCH=arm64 olddefconfig </dev/null
+
+      - name: Find clang toolchain
+        run: |
+          set -e
+          MSM="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/msm-kernel"
+          
+          FOUND=false
+          for search_dir in "$MSM/../prebuilts-master/clang/host/linux-x86" \
+                            "$MSM/../common/prebuilts-master/clang/host/linux-x86" \
+                            "$GITHUB_WORKSPACE/$CONFIG/prebuilts-master/clang/host/linux-x86"; do
+            if [ -d "$search_dir" ]; then
+              latest=$(find "$search_dir" -maxdepth 1 -type d -name "clang-r*" 2>/dev/null | sort -V | tail -n1 || true)
+              if [ -n "$latest" ] && [ -x "$latest/bin/clang" ]; then
+                echo "CLANG_BIN=$latest/bin" >> "$GITHUB_ENV"
+                FOUND=true
+                echo "✓ Found prebuilt clang at: $latest/bin"
+                break
+              fi
+            fi
+          done
+
+          if ! $FOUND; then
+            SYSTEM_CLANG=$(dirname "$(command -v clang)")
+            echo "CLANG_BIN=$SYSTEM_CLANG" >> "$GITHUB_ENV"
+            echo "✓ Using system clang at: $SYSTEM_CLANG"
+          fi
+
+      - name: Kernel prepare
+        run: |
+          set -e
+          MSM="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/msm-kernel"
+          OUT="$MSM/out"
+
+          export PATH="${CLANG_BIN}:$PATH:/usr/lib/ccache"
+          export HOSTCC=clang
+          export HOSTCXX=clang++
+
+          declare -a MAKE_FLAGS=(
+            LLVM=1
+            LLVM_IAS=1
+            ARCH=arm64
+            SUBARCH=arm64
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            LD=ld.lld
+            HOSTLD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            DEPMOD=depmod
+            DTC=dtc
+            STRIP=llvm-strip
+            CC=clang
+          )
+
+          cd "$MSM"
+          echo "Step 1: Generate gki_defconfig..."
+          make "${MAKE_FLAGS[@]}" O="$OUT" gki_defconfig
+
+          echo "Step 2: Configure WiFi modules to modular..."
+          if [ -x ./scripts/config ]; then
+            ./scripts/config --file "$OUT/.config" --set-val CONFIG_CFG80211 m
+            ./scripts/config --file "$OUT/.config" --set-val CONFIG_MAC80211 m
+            ./scripts/config --file "$OUT/.config" --set-val CONFIG_WLAN m
+            ./scripts/config --file "$OUT/.config" --enable CONFIG_WIRELESS
+            ./scripts/config --file "$OUT/.config" --enable CONFIG_WIRELESS_EXT
+            ./scripts/config --file "$OUT/.config" --enable CONFIG_WEXT_PRIV
+          fi
+
+          echo "Step 3: Prepare kernel headers and modules_prepare..."
+          make "${MAKE_FLAGS[@]}" O="$OUT" olddefconfig 2>&1 | tail -20
+          make "${MAKE_FLAGS[@]}" O="$OUT" prepare 2>&1 | tail -20
+          make "${MAKE_FLAGS[@]}" O="$OUT" modules_prepare 2>&1 | tail -20
+
+          echo "Step 4: Disable incompatible kernel features..."
+          if [ -x ./scripts/config ]; then
+            ./scripts/config --file "$OUT/.config" --disable CONFIG_CFI
+            ./scripts/config --file "$OUT/.config" --disable CONFIG_CFI_CLANG
+            ./scripts/config --file "$OUT/.config" --disable CONFIG_LTO_CLANG
+            ./scripts/config --file "$OUT/.config" --disable CONFIG_LTO_CLANG_THIN
+            ./scripts/config --file "$OUT/.config" --disable CONFIG_SHADOW_CALL_STACK
+            ./scripts/config --file "$OUT/.config" --disable CONFIG_KASAN
+            ./scripts/config --file "$OUT/.config" --disable CONFIG_KASAN_SW_TAGS
+            ./scripts/config --file "$OUT/.config" --disable CONFIG_KASAN_HW_TAGS
+            ./scripts/config --file "$OUT/.config" --disable CONFIG_UBSAN
+            ./scripts/config --file "$OUT/.config" --disable CONFIG_UBSAN_TRAP
+            ./scripts/config --file "$OUT/.config" --disable CONFIG_UBSAN_BOUNDS
+          fi
+
+          echo "Step 5: Final olddefconfig and prepare..."
+          make "${MAKE_FLAGS[@]}" O="$OUT" olddefconfig 2>&1 | tail -20
+          make "${MAKE_FLAGS[@]}" O="$OUT" prepare 2>&1 | tail -20
+          make "${MAKE_FLAGS[@]}" O="$OUT" modules_prepare 2>&1 | tail -20
+
+          echo "✓ Kernel preparation complete"
+          echo "Kernel build output location: $OUT"
+          ls -la "$OUT" | head -20
+
+      - name: Download backports
+        run: |
+          set -e
+          RELEASE="${{ github.event.inputs.backports_release }}"
+          echo "Downloading backports: $RELEASE"
+
+          wget -v -O backports.tar.xz \
+            "https://cdn.kernel.org/pub/linux/kernel/projects/backports/stable/v6.1.97/backports-6.1.97-1.tar.xz"
+
+          echo "✓ Downloaded, extracting..."
+          tar -xf backports.tar.xz
+          mv "$RELEASE" backports-stable
+
+          echo "✓ Backports extracted"
+          ls -la backports-stable/ | head -10
+
+      - name: Patch compat for CFI
+        run: |
+          set -e
+          cd backports-stable
+
+          FILE="backport-include/linux/module.h"
+          if [ -f "$FILE" ]; then
+            echo "Patching CFI compatibility in $FILE..."
+            sed -i 's/__CFI_ADDRESSABLE(init_module, __initdata)/__CFI_ADDRESSABLE(init_module)/g' "$FILE"
+            sed -i 's/__CFI_ADDRESSABLE(cleanup_module, __exitdata)/__CFI_ADDRESSABLE(cleanup_module)/g' "$FILE"
+            echo "✓ CFI patch applied"
+          else
+            echo "⟳ File not found, skipping CFI patch"
+          fi
+
+      - name: Create comprehensive backports config for Mediatek + Realtek
+        run: |
+          set -e
+          cd backports-stable
+
+          echo "Creating comprehensive backports configuration..."
+
+          # FIXED: Comprehensive config with all dependencies
+          cat > .config <<'CONFIGEOF'
+          # Core wireless stack (REQUIRED)
+          CONFIG_CFG80211=m
+          CONFIG_MAC80211=m
+          CONFIG_CFG80211_WEXT=y
+          CONFIG_MAC80211_RC_MINSTREL=y
+          CONFIG_MAC80211_LEDS=y
+
+          # Wireless extensions (REQUIRED)
+          CONFIG_WIRELESS_EXT=y
+          CONFIG_WEXT_PRIV=y
+          CONFIG_WEXT_CORE=y
+          CONFIG_WEXT_PROC=y
+          CONFIG_WEXT_SPY=y
+
+          # MediaTek MT76 Core (REQUIRED for all MT drivers)
+          CONFIG_MT76_CORE=m
+          CONFIG_MT76_LEDS=y
+          CONFIG_MT76_USB=m
+          CONFIG_MT76_MMIO=m
+          CONFIG_MT76_SDIO=m
+
+          # MediaTek MT7921 (USB/PCIe/SDIO)
+          CONFIG_MT7921_COMMON=m
+          CONFIG_MT7921U=m
+          CONFIG_MT7921E=m
+          CONFIG_MT7921S=m
+
+          # MediaTek MT7615
+          CONFIG_MT7615_COMMON=m
+          CONFIG_MT7615E=m
+
+          # MediaTek MT7663
+          CONFIG_MT7663_USB_SDIO_COMMON=m
+          CONFIG_MT7663U=m
+          CONFIG_MT7663S=m
+
+          # Realtek RTL8XXXU (USB) - Unified driver
+          CONFIG_RTL8XXXU=m
+          CONFIG_RTL8XXXU_UNTESTED=y
+
+          # Realtek Staging Drivers
+          CONFIG_RTL8188EU=m
+          CONFIG_RTL8192EU=m
+          CONFIG_RTL8723BU=m
+          CONFIG_RTL8723CU=m
+          CONFIG_RTL8821CU=m
+
+          # Realtek RTW88 Core (REQUIRED for RTW88 drivers)
+          CONFIG_RTW88=m
+          CONFIG_RTW88_CORE=m
+          CONFIG_RTW88_USB=m
+          CONFIG_RTW88_SDIO=m
+          CONFIG_RTW88_8822B=m
+          CONFIG_RTW88_8822C=m
+          CONFIG_RTW88_8723D=m
+          CONFIG_RTW88_8821C=m
+          CONFIG_RTW88_DEBUG=y
+          CONFIG_RTW88_DEBUGFS=y
+
+          # Realtek RTW89 (newer generation)
+          CONFIG_RTW89=m
+          CONFIG_RTW89_CORE=m
+          CONFIG_RTW89_8852AE=m
+          CONFIG_RTW89_8852BE=m
+          CONFIG_RTW89_8852CE=m
+          CONFIG_RTW89_DEBUG=y
+          CONFIG_RTW89_DEBUGFS=y
+
+          # Disable non-target drivers to speed up build
+          CONFIG_IWLWIFI=n
+          CONFIG_IWLMVM=n
+          CONFIG_IWLDVM=n
+          CONFIG_ATH10K=n
+          CONFIG_ATH11K=n
+          CONFIG_ATH9K=n
+          CONFIG_BRCMFMAC=n
+          CONFIG_MWIFIEX=n
+          CONFIG_WL18XX=n
+          CONFIG_WLCORE=n
+          CONFIGEOF
+
+          echo "✓ Comprehensive .config created"
+          echo ""
+          echo "Configuration content:"
+          cat .config
+
+      - name: Configure backports with oldconfig (FIXED)
+        run: |
+          set -e
+          KERNEL_BUILD="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/msm-kernel/out"
+
+          export PATH="${CLANG_BIN}:$PATH:/usr/lib/ccache"
+
+          declare -a MAKE_FLAGS=(
+            LLVM=1
+            LLVM_IAS=1
+            ARCH=arm64
+            SUBARCH=arm64
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            LD=ld.lld
+            HOSTLD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            DEPMOD=depmod
+            DTC=dtc
+            STRIP=llvm-strip
+            HOSTCC=clang
+            HOSTCXX=clang++
+            CC=clang
+          )
+
+          cd backports-stable
+
+          echo "Running oldconfig to process configuration..."
+          yes "" | make "${MAKE_FLAGS[@]}" \
+            KLIB="$KERNEL_BUILD" \
+            KLIB_BUILD="$KERNEL_BUILD" \
+            oldconfig 2>&1 | tee oldconfig.log
+
+          echo ""
+          echo "✓ Configuration processed"
+          echo ""
+          
+          # FIXED: Verify critical configs are set
+          echo "Verifying critical configuration options..."
+          grep -E "CONFIG_(MT7921|RTL8XXXU|RTW88|CFG80211|MAC80211)" .config | grep "=m" || {
+            echo "WARNING: Some driver configs might not be set correctly!"
+            echo "Full config:"
+            cat .config
+          }
+
+      - name: Clean backports build directory
+        run: |
+          cd backports-stable
+          echo "Cleaning previous build artifacts..."
+          make clean 2>/dev/null || true
+          find . -name "*.o" -delete
+          find . -name "*.ko" -delete
+          find . -name ".tmp_versions" -type d -exec rm -rf {} + 2>/dev/null || true
+          find . -name "modules.order" -delete
+          echo "✓ Build directory cleaned"
+
+      - name: Build backports modules (FIXED)
+        run: |
+          set -e
+          KERNEL_BUILD="$GITHUB_WORKSPACE/$CONFIG/kernel_platform/msm-kernel/out"
+
+          export PATH="${CLANG_BIN}:$PATH:/usr/lib/ccache"
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+          mkdir -p "$CCACHE_DIR"
+
+          declare -a MAKE_FLAGS=(
+            LLVM=1
+            LLVM_IAS=1
+            ARCH=arm64
+            SUBARCH=arm64
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            LD=ld.lld
+            HOSTLD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            DEPMOD=depmod
+            DTC=dtc
+            STRIP=llvm-strip
+            HOSTCC=clang
+            HOSTCXX=clang++
+            CC=clang
+          )
+
+          cd backports-stable
+
+          echo "Building backports modules..."
+          echo "Build jobs: ${{ github.event.inputs.build_jobs }}"
+          echo "Building: MediaTek MT7921/MT76 and Realtek RTL8XXXU/RTW88 drivers"
+
+          # FIXED: Build with configurable parallelism and better error handling
+          make -j${{ github.event.inputs.build_jobs }} \
+            "${MAKE_FLAGS[@]}" \
+            KLIB="$KERNEL_BUILD" \
+            KLIB_BUILD="$KERNEL_BUILD" \
+            V=1 \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+          BUILD_EXIT=${PIPESTATUS[0]}
+
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo ""
+            echo "✗ Build failed with exit code $BUILD_EXIT"
+            echo ""
+            echo "Last 200 lines of build output:"
+            tail -200 "$GITHUB_WORKSPACE/build.log"
+            
+            echo ""
+            echo "Searching for critical errors:"
+            grep -i "error:" "$GITHUB_WORKSPACE/build.log" | tail -50
+            
+            exit 1
+          fi
+
+          echo ""
+          echo "✓ Build completed successfully"
+
+      - name: Verify .ko files generated (ENHANCED)
+        run: |
+          set -e
+          cd backports-stable
+
+          echo "=== Searching for .ko files ==="
+          KO_FILES=$(find . -name "*.ko" -type f 2>/dev/null || true)
+          KO_COUNT=$(echo "$KO_FILES" | grep -c '\.ko$' || echo "0")
+
+          echo "Total .ko files found: $KO_COUNT"
+
+          if [ "$KO_COUNT" -eq 0 ]; then
+            echo "✗ CRITICAL: No .ko files generated!"
+            echo ""
+            echo "Checking for build errors in log..."
+            grep -i "error\|undefined\|failed" "$GITHUB_WORKSPACE/build.log" | tail -50
+            
+            echo ""
+            echo "Checking Makefile targets..."
+            make help | grep -i module || true
+            
+            echo ""
+            echo "Listing built objects:"
+            find . -name "*.o" | head -20
+            
+            exit 1
+          fi
+
+          echo ""
+          echo "✓ .ko files generated:"
+          echo "$KO_FILES" | sort
+
+          echo ""
+          echo "Module details:"
+          for ko in $(echo "$KO_FILES" | sort); do
+            if [ -n "$ko" ] && [ -f "$ko" ]; then
+              size=$(du -h "$ko" | cut -f1)
+              modinfo "$ko" 2>/dev/null | grep -E "^(filename|description|author|license|depends):" | sed "s/^/    /" || true
+              echo "  [$size] $ko"
+            fi
+          done
+          
+          # FIXED: Check for specific critical modules
+          echo ""
+          echo "Checking for critical WiFi modules:"
+          for module in cfg80211 mac80211 mt76 mt7921 rtl8xxxu rtw88_core compat; do
+            if echo "$KO_FILES" | grep -q "${module}\.ko"; then
+              echo "  ✓ Found: ${module}.ko"
+            else
+              echo "  ✗ Missing: ${module}.ko"
+            fi
+          done
+
+      - name: Extract and organize modules (ENHANCED)
+        run: |
+          set -e
+          cd backports-stable
+
+          echo "Creating organized modules output directory..."
+          mkdir -p ../modules-out
+
+          echo "Copying .ko files with structure preservation..."
+          # Copy with full path info for debugging
+          find . -name "*.ko" -type f | while read ko; do
+            basename_ko=$(basename "$ko")
+            cp -v "$ko" "../modules-out/${basename_ko}"
+            echo "  Copied: $ko -> ../modules-out/${basename_ko}"
+          done
+
+          echo ""
+          echo "=== Files in modules-out ==="
+          ls -lh ../modules-out/ || true
+
+          if [ $(ls -1 ../modules-out/*.ko 2>/dev/null | wc -l) -eq 0 ]; then
+            echo "✗ ERROR: No .ko files copied!"
+            echo "Debug: Checking source location..."
+            find . -name "*.ko" -ls
+            exit 1
+          fi
+
+          echo ""
+          echo "Creating archive..."
+          cd ../modules-out
+         
