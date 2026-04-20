@@ -795,5 +795,5 @@ jobs:
             wireless-modules-*.tar.gz
           draft: false
           prerelease: false
-        env:
+          env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
