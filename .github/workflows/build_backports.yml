@@ -1,32 +1,29 @@
 name: Build Backports Tar
 
 on:
-  # Ձեռքով գործարկում երկու մանիֆեստներով
   workflow_dispatch:
     inputs:
       source_repo:
-        description: 'Source kernel repository URL'
+        description: 'Source kernel repo (usually Linux-stable)'
         required: true
         default: 'https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git'
       source_branch:
-        description: 'Source branch/tag'
+        description: 'Source branch/tag (e.g., v6.6)'
         required: true
         default: 'v6.6'
       target_repo:
-        description: 'Target kernel repository URL'
+        description: 'Target kernel repo (your Android kernel)'
         required: true
         default: 'https://android.googlesource.com/kernel/common'
       target_branch:
-        description: 'Target branch/tag'
+        description: 'Target branch/tag (e.g., android14-6.1-lts)'
         required: true
         default: 'android14-6.1-lts'
-      # Ընտրովի՝ backports-ի արդյունքի անվանման պրեֆիքս
       output_prefix:
         description: 'Output archive prefix'
         required: false
         default: 'backports'
 
-  # Պահպանում ենք հին release trigger-ը (հետադարձ համատեղելի)
   release:
     types: [published]
 
@@ -42,17 +39,14 @@ jobs:
       - name: Determine Kernel Parameters
         id: params
         env:
-          # workflow_dispatch-ի input-ները
           SRC_REPO: ${{ github.event.inputs.source_repo }}
           SRC_BRANCH: ${{ github.event.inputs.source_branch }}
           TGT_REPO: ${{ github.event.inputs.target_repo }}
           TGT_BRANCH: ${{ github.event.inputs.target_branch }}
           PREFIX: ${{ github.event.inputs.output_prefix }}
-          # release-ի դեպքում target-ը վերցնում ենք tag-ից
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           if [ -n "$RELEASE_TAG" ]; then
-            # release trigger – օգտագործում ենք հին տրամաբանությունը (target = linux-stable, source = current)
             KERNEL_TARGET=$(echo $RELEASE_TAG | sed 's/^backports-v//')
             echo "source_repo=https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git" >> $GITHUB_OUTPUT
             echo "source_branch=v${KERNEL_TARGET}" >> $GITHUB_OUTPUT
@@ -60,7 +54,6 @@ jobs:
             echo "target_branch=v${KERNEL_TARGET}" >> $GITHUB_OUTPUT
             echo "output_prefix=backports-${KERNEL_TARGET}" >> $GITHUB_OUTPUT
           else
-            # workflow_dispatch
             echo "source_repo=${SRC_REPO}" >> $GITHUB_OUTPUT
             echo "source_branch=${SRC_BRANCH}" >> $GITHUB_OUTPUT
             echo "target_repo=${TGT_REPO}" >> $GITHUB_OUTPUT
@@ -84,24 +77,28 @@ jobs:
       - name: Checkout backports tool
         uses: actions/checkout@v5
 
-      - name: Clone source kernel
+      - name: Clone source kernel (Linux-stable)
         env:
           REPO: ${{ steps.params.outputs.source_repo }}
           BRANCH: ${{ steps.params.outputs.source_branch }}
         run: |
+          echo "Cloning source kernel from ${REPO} branch ${BRANCH}"
           git clone --depth=1 --branch ${BRANCH} ${REPO} source-kernel
 
-      - name: Clone target kernel
+      - name: Clone target kernel (Android)
         env:
           REPO: ${{ steps.params.outputs.target_repo }}
           BRANCH: ${{ steps.params.outputs.target_branch }}
         run: |
+          echo "Cloning target kernel from ${REPO} branch ${BRANCH}"
           git clone --depth=1 --branch ${BRANCH} ${REPO} target-kernel
 
       - name: Build Backports (source → target)
         env:
           PREFIX: ${{ steps.params.outputs.output_prefix }}
         run: |
+          # gentree.py expects the source kernel to have a full wireless tree.
+          # It will create the backport output in directory $PREFIX.
           python3 gentree.py --clean source-kernel ${PREFIX}
 
       - name: Pack Backports Tar
@@ -110,7 +107,7 @@ jobs:
         run: |
           tar -c ${PREFIX} | zstd > ${PREFIX}.tar.zst
 
-      - name: Upload artifact (optional)
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.params.outputs.output_prefix }}
