@@ -18,7 +18,7 @@ on:
       target_branch:
         description: 'Target branch/tag (e.g., android14-6.1-lts)'
         required: true
-        default: 'oneplus/sm8475_b_16.0.0_oneplus11r'
+        default: 'oneplus/sm8475_b_16.0.0_ace_2'
       output_prefix:
         description: 'Output archive prefix'
         required: false
