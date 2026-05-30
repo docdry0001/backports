@@ -1,7 +1,21 @@
-
 name: Build Backports Tar
 
 on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source kernel repo (usually Linux-stable)'
+        required: true
+        default: 'https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8635.git'
+      source_branch:
+        description: 'Source branch/tag (e.g., v6.6)'
+        required: true
+        default: 'oneplus/sm8635_b_16.0.0_nord_5'
+      output_prefix:
+        description: 'Output archive prefix'
+        required: false
+        default: 'backports'
+
   release:
     types: [published]
 
@@ -14,20 +28,29 @@ jobs:
       image: alpine:latest
 
     steps:
-      - name: Get Kernel Tag
-        id: get_kernel_tag
+      - name: Determine Kernel Parameters
+        id: params
         env:
-          TAG_NAME: ${{ github.event.release.tag_name }}
-        run:
-          KERNEL_TARGET=$(echo $TAG_NAME | sed 's/^backports-v//')
-
-          echo "Targetting Kernel Version for Backports $KERNEL_TARGET"
-
-          echo "kernel_target=$KERNEL_TARGET" >> $GITHUB_OUTPUT
+          SRC_REPO: ${{ github.event.inputs.source_repo }}
+          SRC_BRANCH: ${{ github.event.inputs.source_branch }}
+          PREFIX: ${{ github.event.inputs.output_prefix }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            KERNEL_TARGET=$(echo $RELEASE_TAG | sed 's/^backports-v//')
+            echo "source_repo=https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git" >> $GITHUB_OUTPUT
+            echo "source_branch=v${KERNEL_TARGET}" >> $GITHUB_OUTPUT
+            echo "output_prefix=backports-${KERNEL_TARGET}" >> $GITHUB_OUTPUT
+          else
+            echo "source_repo=${SRC_REPO}" >> $GITHUB_OUTPUT
+            echo "source_branch=${SRC_BRANCH}" >> $GITHUB_OUTPUT
+            echo "output_prefix=${PREFIX:-backports}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Install Dependencies
         run: |
           apk update && apk add git python3 ocaml ocaml-compiler-libs ncurses-dev autoconf automake pkgconfig musl-dev make patch zstd
+
       - name: Build Coccinelle
         run: |
           git clone --depth=1 https://github.com/coccinelle/coccinelle.git
@@ -36,27 +59,40 @@ jobs:
           ./configure
           make
           make install
-      - name: Checkout
+
+      - name: Checkout backports tool
         uses: actions/checkout@v5
 
-      - name: Clone linux-stable
+      - name: Clone source kernel (Linux-stable)
         env:
-          KERNEL_VER: ${{ steps.get_kernel_tag.outputs.kernel_target }}
+          REPO: ${{ steps.params.outputs.source_repo }}
+          BRANCH: ${{ steps.params.outputs.source_branch }}
         run: |
-          git clone --depth=1 --branch v${{ env.KERNEL_VER }} https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux-stable
-      - name: Fix ownership
-        run: |
-          chown -R root:root /__w/backports
+          echo "Cloning source kernel from ${REPO} branch ${BRANCH}"
+          git clone --depth=1 --branch ${BRANCH} ${REPO} source-kernel
+
+      # target kernel-ի կլոնավորումը հեռացված է, քանի որ պետք չէ
+
       - name: Build Backports
         env:
-          KERNEL_VER: ${{ steps.get_kernel_tag.outputs.kernel_target }}
-        run: python3 gentree.py --clean linux-stable backports-${{ env.KERNEL_VER }}
+          PREFIX: ${{ steps.params.outputs.output_prefix }}
+        run: |
+          python3 gentree.py --clean source-kernel ${PREFIX}
 
       - name: Pack Backports Tar
         env:
-          KERNEL_VER: ${{ steps.get_kernel_tag.outputs.kernel_target }}
+          PREFIX: ${{ steps.params.outputs.output_prefix }}
         run: |
-          tar -c backports-${{ env.KERNEL_VER }} | zstd > backports-${{ env.KERNEL_VER }}.tar.zst
-      - uses: softprops/action-gh-release@v1
+          tar -c ${PREFIX} | zstd > ${PREFIX}.tar.zst
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: backports-${{ steps.get_kernel_tag.outputs.kernel_target }}.tar.zst
+          name: ${{ steps.params.outputs.output_prefix }}
+          path: ${{ steps.params.outputs.output_prefix }}.tar.zst
+
+      - name: Release upload (if triggered by release)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ steps.params.outputs.output_prefix }}.tar.zst
