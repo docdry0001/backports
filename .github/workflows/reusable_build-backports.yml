@@ -1,30 +1,31 @@
-name: Build Backports Tar
+name: Build Backports Tar (MediaTek mt76)
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Mainline kernel repo'
+        required: true
+        default: 'https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git'
+      source_branch:
+        description: 'Kernel version tag'
+        required: true
+        default: 'v6.6'
+      output_prefix:
+        description: 'Output prefix'
+        required: false
+        default: 'backports-mt76'
 
 jobs:
   build-backports:
-    name: Build Backports Tar
     runs-on: ubuntu-latest
-
     container:
       image: alpine:latest
-
     steps:
-      - name: Get Kernel Tag
-        id: get_kernel_tag
-        env:
-          TAG_NAME: ${{ github.event.release.tag_name }}
-        run:
-          KERNEL_TARGET=$(echo $TAG_NAME | sed 's/^backports-v//')
+      - name: Checkout backports tool
+        uses: actions/checkout@v5
 
-          echo "Targetting Kernel Version for Backports $KERNEL_TARGET"
-
-          echo "kernel_target=$KERNEL_TARGET" >> $GITHUB_OUTPUT
-
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           apk update && apk add git python3 ocaml ocaml-compiler-libs ncurses-dev autoconf automake pkgconfig musl-dev make patch zstd
 
@@ -32,35 +33,19 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/coccinelle/coccinelle.git
           cd coccinelle
-          ./autogen
-          ./configure
-          make
-          make install
+          ./autogen && ./configure && make && make install
 
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Clone linux-stable
+      - name: Clone source kernel
         env:
-          KERNEL_VER: ${{ steps.get_kernel_tag.outputs.kernel_target }}
-        run: |
-          git clone --depth=1 --branch v${{ env.KERNEL_VER }} https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux-stable
+          REPO: ${{ github.event.inputs.source_repo }}
+          BRANCH: ${{ github.event.inputs.source_branch }}
+        run: git clone --depth=1 --branch ${BRANCH} ${REPO} source-kernel
 
-      - name: Fix ownership
-        run: |
-          chown -R root:root /__w/backports
-
-      - name: Build Backports
+      - name: Build Backports (MediaTek mt76)
         env:
-          KERNEL_VER: ${{ steps.get_kernel_tag.outputs.kernel_target }}
-        run: python3 gentree.py --clean linux-stable backports-${{ env.KERNEL_VER }}
-
-      - name: Pack Backports Tar
-        env:
-          KERNEL_VER: ${{ steps.get_kernel_tag.outputs.kernel_target }}
+          PREFIX: ${{ github.event.inputs.output_prefix }}
         run: |
-          tar -c backports-${{ env.KERNEL_VER }} | zstd > backports-${{ env.KERNEL_VER }}.tar.zst
+          python3 gentree.py --clean --copy-list copy-list-mt76 source-kernel ${PREFIX}
 
-      - uses: softprops/action-gh-release@v1
-        with:
-          files: backports-${{ steps.get_kernel_tag.outputs.kernel_target }}.tar.zst
+      - name: Pack & Upload
+        ...
