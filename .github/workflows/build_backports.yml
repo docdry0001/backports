@@ -6,19 +6,19 @@ on:
       source_repo:
         description: 'Source kernel repo (usually Linux-stable)'
         required: true
-        default: 'https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git'
+        default: 'https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8635.git'
       source_branch:
         description: 'Source branch/tag (e.g., v6.6)'
         required: true
-        default: 'v6.6'
+        default: 'oneplus/sm8635_b_16.0.0_nord_5'
       target_repo:
         description: 'Target kernel repo (your Android kernel)'
         required: true
-        default: 'https://android.googlesource.com/kernel/common'
+        default: 'https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8475.git'
       target_branch:
         description: 'Target branch/tag (e.g., android14-6.1-lts)'
         required: true
-        default: 'android14-6.1-lts'
+        default: 'oneplus/sm8475_b_16.0.0_oneplus11r'
       output_prefix:
         description: 'Output archive prefix'
         required: false
