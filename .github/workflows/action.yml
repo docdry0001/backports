@@ -4,18 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: 'Source kernel repo (usually Linux-stable)'
+        description: 'Source kernel repo (mainline Linux tree, e.g. stable)'
         required: true
-        default: 'https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8635.git'
+        default: 'https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git'
       source_branch:
         description: 'Source branch/tag (e.g., v6.6)'
         required: true
-        default: 'oneplus/sm8635_b_16.0.0_nord_5'
+        default: 'v6.6'
       output_prefix:
         description: 'Output archive prefix'
         required: false
         default: 'backports'
-
   release:
     types: [published]
 
