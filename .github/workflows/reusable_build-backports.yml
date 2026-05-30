@@ -1,45 +1,65 @@
-name: Build Backports Tar (MediaTek mt76)
+name: Build Backports – MediaTek mt76 (mt7921u)
 
 on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: 'Mainline kernel repo'
+        description: 'Mainline Linux kernel repo'
         required: true
         default: 'https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git'
       source_branch:
-        description: 'Kernel version tag'
+        description: 'Kernel version tag (e.g., v6.6, v6.1)'
         required: true
         default: 'v6.6'
       output_prefix:
-        description: 'Output prefix'
+        description: 'Output archive prefix'
         required: false
         default: 'backports-mt76'
 
 jobs:
   build-backports:
+    name: Build Backports Tar (mt76)
     runs-on: ubuntu-latest
     container:
       image: alpine:latest
+
     steps:
       - name: Checkout backports tool
         uses: actions/checkout@v5
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
-          apk update && apk add git python3 ocaml ocaml-compiler-libs ncurses-dev autoconf automake pkgconfig musl-dev make patch zstd
+          apk update && apk add git python3 ocaml ocaml-compiler-libs \
+              ncurses-dev autoconf automake pkgconfig musl-dev make patch zstd
 
       - name: Build Coccinelle
         run: |
           git clone --depth=1 https://github.com/coccinelle/coccinelle.git
           cd coccinelle
-          ./autogen && ./configure && make && make install
+          ./autogen
+          ./configure
+          make -j$(nproc)
+          make install
 
-      - name: Clone source kernel
+      - name: Create copy-list-mt76 (mediaTek mt76 minimal set)
+        run: |
+          cat > copy-list-mt76 << 'EOF'
+          # MediaTek mt76 backport – minimal set for mt7921u
+          drivers/net/wireless/mediatek/mt76/
+          include/net/cfg80211.h
+          include/net/mac80211.h
+          include/uapi/linux/nl80211.h
+          include/uapi/linux/genetlink.h
+          include/linux/ieee80211.h
+          EOF
+
+      - name: Clone source kernel (mainline)
         env:
           REPO: ${{ github.event.inputs.source_repo }}
           BRANCH: ${{ github.event.inputs.source_branch }}
-        run: git clone --depth=1 --branch ${BRANCH} ${REPO} source-kernel
+        run: |
+          echo "Cloning source kernel from ${REPO} (branch/tag: ${BRANCH})"
+          git clone --depth=1 --branch ${BRANCH} ${REPO} source-kernel
 
       - name: Build Backports (MediaTek mt76)
         env:
@@ -47,5 +67,14 @@ jobs:
         run: |
           python3 gentree.py --clean --copy-list copy-list-mt76 source-kernel ${PREFIX}
 
-      - name: Pack & Upload
-        ...
+      - name: Pack Backports into tar.zst
+        env:
+          PREFIX: ${{ github.event.inputs.output_prefix }}
+        run: |
+          tar -c ${PREFIX} | zstd -T0 > ${PREFIX}.tar.zst
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.output_prefix }}
+          path: ${{ github.event.inputs.output_prefix }}.tar.zst
