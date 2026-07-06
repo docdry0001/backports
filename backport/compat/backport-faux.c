@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 
-#if LINUX_VERSION_IS_LESS(6,14,0)
-
 #include <linux/device/faux.h>
+#include <linux/export.h>
+#include <linux/slab.h>
 
 struct faux_platform_data {
 	const struct faux_device_ops *faux_ops;
@@ -193,5 +193,3 @@ void backport_faux_device_destroy(struct faux_device *faux_dev)
 	kfree(drv);
 }
 EXPORT_SYMBOL_GPL(backport_faux_device_destroy);
-
-#endif

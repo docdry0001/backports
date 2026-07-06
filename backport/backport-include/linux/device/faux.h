@@ -1,7 +1,9 @@
 #ifndef __BACKPORT_DEVICE_FAUX_H
 #define __BACKPORT_DEVICE_FAUX_H
 
-#if LINUX_VERSION_IS_LESS(6,14,0)
+#if LINUX_VERSION_IS_GEQ(6,14,0)
+#include_next <linux/device/faux.h>
+#else
 
 #include <linux/container_of.h>
 #include <linux/device.h>
